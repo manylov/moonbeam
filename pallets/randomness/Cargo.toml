@@ -15,13 +15,13 @@ frame-support = { git = "https://github.com/purestake/substrate", branch = "moon
 frame-system = { git = "https://github.com/purestake/substrate", branch = "moonbeam-polkadot-v0.9.17", default-features = false }
 parity-scale-codec = { version = "2.0.0", default-features = false, features = [ "derive" ] }
 scale-info = { version = "1.0", default-features = false, features = [ "derive" ] }
+sp-io = { git = "https://github.com/purestake/substrate", branch = "moonbeam-polkadot-v0.9.17" }
 sp-runtime = { git = "https://github.com/purestake/substrate", branch = "moonbeam-polkadot-v0.9.17", default-features = false }
 sp-std = { git = "https://github.com/purestake/substrate", branch = "moonbeam-polkadot-v0.9.17", default-features = false }
 
 [dev-dependencies]
 pallet-balances = { git = "https://github.com/purestake/substrate", branch = "moonbeam-polkadot-v0.9.17" }
 sp-core = { git = "https://github.com/purestake/substrate", branch = "moonbeam-polkadot-v0.9.17" }
-sp-io = { git = "https://github.com/purestake/substrate", branch = "moonbeam-polkadot-v0.9.17" }
 
 [features]
 default = [ "std" ]
@@ -35,6 +35,7 @@ std = [
 	"serde",
 	"sp-runtime/std",
 	"sp-std/std",
+	"sp-io/std",
 ]
 runtime-benchmarks = [ "frame-benchmarking" ]
 try-runtime = [ "frame-support/try-runtime" ]
