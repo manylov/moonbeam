@@ -38,7 +38,7 @@ pub use pallet::*;
 pub mod pallet {
 	// use crate::WeightInfo;
 	use frame_support::pallet_prelude::*;
-	use frame_support::traits::{Currency, ReservableCurrency};
+	use frame_support::traits::{Currency, ExistenceRequirement::KeepAlive, ReservableCurrency};
 	use frame_system::pallet_prelude::*;
 	use sp_runtime::traits::{CheckedSub, Saturating};
 
@@ -84,39 +84,81 @@ pub mod pallet {
 		pub salt: T::Hash,
 		/// Details regarding request type and when it is due
 		pub info: RequestType<T::BlockNumber>,
-		/// All requests expire `T::ExpirationDelay` blocks after they are made
-		pub expires: T::BlockNumber,
 	}
 
 	impl<T: Config> Request<T> {
 		fn can_be_fulfilled(&self) -> bool {
 			self.info.when() <= frame_system::Pallet::<T>::block_number()
 		}
+	}
+
+	#[derive(PartialEq, Clone, Encode, Decode, RuntimeDebug, TypeInfo)]
+	#[scale_info(skip_type_params(T))]
+	pub struct RequestState<T: Config> {
+		/// Fee is returned to this account upon execution
+		pub request: Request<T>,
+		/// Deposit taken for making request (stored in case config changes)
+		pub deposit: BalanceOf<T>,
+		/// All requests expire `T::ExpirationDelay` blocks after they are made
+		pub expires: T::BlockNumber,
+	}
+
+	impl<T: Config> RequestState<T> {
+		fn new(request: Request<T>, deposit: BalanceOf<T>) -> RequestState<T> {
+			RequestState {
+				request,
+				deposit,
+				expires: frame_system::Pallet::<T>::block_number()
+					.saturating_add(T::ExpirationDelay::get()),
+			}
+		}
 		fn fulfill(&self) -> DispatchResult {
 			ensure!(
-				self.can_be_fulfilled(),
+				self.request.can_be_fulfilled(),
 				Error::<T>::RequestCannotYetBeFulfilled
 			);
-			let raw_randomness: T::Hash = match self.info {
+			let raw_randomness: T::Hash = match self.request.info {
 				RequestType::Local { .. } => return Err(Error::<T>::NotYetImplemented.into()),
 				RequestType::Babe { info, .. } => {
 					Pallet::<T>::get_most_recent_babe_randomness(info)
 				}
 			};
-			let randomness = Pallet::<T>::concat_and_hash(raw_randomness, self.salt);
-			T::RandomnessSender::send_randomness(self.contract_address.clone(), randomness);
+			let randomness = Pallet::<T>::concat_and_hash(raw_randomness, self.request.salt);
+			T::RandomnessSender::send_randomness(self.request.contract_address.clone(), randomness);
+			// return deposit to contract_address (TODO: also return execution_cost - fee)
+			T::Currency::unreserve(&self.request.contract_address, self.deposit);
 			Ok(())
 		}
 		fn increase_fee(&mut self, caller: &T::AccountId, new_fee: BalanceOf<T>) -> DispatchResult {
 			ensure!(
-				caller == &self.contract_address,
+				caller == &self.request.contract_address,
 				Error::<T>::OnlyRequesterCanIncreaseFee
 			);
 			let to_reserve = new_fee
-				.checked_sub(&self.fee)
+				.checked_sub(&self.request.fee)
 				.ok_or(Error::<T>::NewFeeMustBeGreaterThanOldFee)?;
 			T::Currency::reserve(caller, to_reserve)?;
-			self.fee = new_fee;
+			self.request.fee = new_fee;
+			Ok(())
+		}
+		/// Unreserve deposit + fee from contract_address
+		/// Transfer fee to caller
+		fn execute_expiration(&self, caller: &T::AccountId) -> DispatchResult {
+			ensure!(
+				frame_system::Pallet::<T>::block_number() >= self.expires,
+				Error::<T>::RequestHasNotExpired
+			);
+			T::Currency::unreserve(
+				&self.request.contract_address,
+				self.deposit + self.request.fee,
+			);
+			T::Currency::transfer(
+				&self.request.contract_address,
+				caller,
+				self.request.fee,
+				KeepAlive,
+			)
+			.expect("just unreserved deposit + fee => fee must be transferrable");
 			Ok(())
 		}
 	}
@@ -153,7 +195,7 @@ pub mod pallet {
 		/// Get relay chain randomness to insert into this pallet
 		type RelayRandomness: GetRelayRandomness<Self::Hash>;
 		/// Send randomness to smart contract
-		/// TODO: why can't Randomness = T::Hash??
+		/// TODO: why can't Randomness = T::Hash?
 		type RandomnessSender: SendRandomness<Self::AccountId, [u8; 32]>;
 		#[pallet::constant]
 		/// The amount that should be taken as a security deposit when requesting randomness.
@@ -168,7 +210,6 @@ pub mod pallet {
 	#[pallet::error]
 	pub enum Error<T> {
 		NotYetImplemented,
-		/// The counter for request IDs overflowed
 		RequestCounterOverflowed,
 		NotSufficientDeposit,
 		CannotRequestPastRandomness,
@@ -176,6 +217,7 @@ pub mod pallet {
 		RequestCannotYetBeFulfilled,
 		OnlyRequesterCanIncreaseFee,
 		NewFeeMustBeGreaterThanOldFee,
+		RequestHasNotExpired,
 	}
 
 	#[pallet::event]
@@ -197,13 +239,16 @@ pub mod pallet {
 			id: RequestId,
 			new_fee: BalanceOf<T>,
 		},
+		RequestExpirationExecuted {
+			id: RequestId,
+		},
 	}
 
 	#[pallet::storage]
 	#[pallet::getter(fn request)]
 	/// Randomness requests not yet fulfilled or purged
 	pub type Requests<T: Config> =
-		StorageMap<_, Blake2_128Concat, RequestId, Request<T>, OptionQuery>;
+		StorageMap<_, Blake2_128Concat, RequestId, RequestState<T>, OptionQuery>;
 
 	#[pallet::storage]
 	#[pallet::getter(fn request_count)]
@@ -288,17 +333,16 @@ pub mod pallet {
 				BabeRandomness::CurrentBlock => <CurrentBlockRandomness<T>>::get(),
 			}
 		}
-		fn concat_and_hash(randomness: T::Hash, salt: T::Hash) -> [u8; 32] {
+		fn concat_and_hash(a: T::Hash, b: T::Hash) -> [u8; 32] {
 			let mut s = Vec::new();
-			s.extend_from_slice(randomness.as_ref());
-			s.extend_from_slice(salt.as_ref());
+			s.extend_from_slice(a.as_ref());
+			s.extend_from_slice(b.as_ref());
 			sp_io::hashing::blake2_256(&s)
 		}
 	}
 
 	// This is where we expose pallet functionality for the precompile
 	impl<T: Config> Pallet<T> {
-		// TODO: separate Expires field from request
 		pub fn request_randomness(request: Request<T>) -> DispatchResult {
 			ensure!(
 				!request.can_be_fulfilled(),
@@ -326,6 +370,7 @@ pub mod pallet {
 				salt: request.salt,
 				info: request.info,
 			});
+			let request: RequestState<T> = RequestState::new(request, deposit);
 			<Requests<T>>::insert(request_id, request);
 			Ok(())
 		}
@@ -337,8 +382,6 @@ pub mod pallet {
 			let request = <Requests<T>>::get(id).ok_or(Error::<T>::RequestDNE)?;
 			// fulfill randomness request
 			request.fulfill()?;
-			// return deposit to contract_address
-			T::Currency::unreserve(&request.contract_address, T::Deposit::get());
 			<Requests<T>>::remove(id);
 			Self::deposit_event(Event::RequestFulfilled { id });
 			Ok(())
@@ -356,13 +399,13 @@ pub mod pallet {
 			Ok(())
 		}
 		/// Execute request expiration
-		/// Pays fee to caller
-		/// Purges request if it has expired
-		pub fn execute_request_expiration(
-			caller: T::AccountId,
-			id: RequestId,
-			new_amount: BalanceOf<T>,
-		) -> DispatchResult {
+		/// transfers fee to caller && purges request iff it has expired
+		/// does NOT try to fulfill the request
+		pub fn execute_request_expiration(caller: T::AccountId, id: RequestId) -> DispatchResult {
+			let request = <Requests<T>>::get(id).ok_or(Error::<T>::RequestDNE)?;
+			request.execute_expiration(&caller)?;
+			<Requests<T>>::remove(id);
+			Self::deposit_event(Event::RequestExpirationExecuted { id });
 			Ok(())
 		}
 		pub fn instant_babe_randomness(
@@ -376,15 +419,10 @@ pub mod pallet {
 			Ok(())
 		}
 		pub fn instant_local_randomness(
-			contract_address: T::AccountId,
-			salt: T::Hash,
+			_contract_address: T::AccountId,
+			_salt: T::Hash,
 		) -> DispatchResult {
 			Err(Error::<T>::NotYetImplemented.into())
 		}
 	}
 }
-
-// need to DO
-// mocks
-// tests
-// precompile
